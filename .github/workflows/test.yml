@@ -1,0 +1,374 @@
+name: Test
+
+# Single entry point for all composite action and reusable workflow tests.
+# The 'test' gate job is the one to add to branch protection.
+#
+# Each test group runs only when its corresponding paths are touched in the PR,
+# using dorny/paths-filter to detect changes. All test groups also run on
+# workflow_dispatch (manual trigger) regardless of changed files.
+# Changing this file itself triggers all test groups.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Detect changed paths ──────────────────────────────────────────────────
+
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      http_smoke_test:        ${{ steps.filter.outputs.http_smoke_test }}
+      smoke_collect_summary:  ${{ steps.filter.outputs.smoke_collect_summary }}
+      scheduled_tag_release:  ${{ steps.filter.outputs.scheduled_tag_release }}
+      terraform_summary:      ${{ steps.filter.outputs.terraform_summary }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            http_smoke_test:
+              - .github/actions/http-smoke-test/**
+              - .github/workflows/test.yml
+            smoke_collect_summary:
+              - .github/actions/smoke-test-collect/**
+              - .github/actions/smoke-test-summary/**
+              - .github/workflows/test.yml
+            scheduled_tag_release:
+              - .github/workflows/scheduled-tag-release.yml
+              - .github/workflows/test.yml
+            terraform_summary:
+              - .github/workflows/terraform-required-check.yml
+              - .github/workflows/test.yml
+
+  # ── http-smoke-test ───────────────────────────────────────────────────────
+
+  http-smoke-pass-200:
+    name: 'HTTP Smoke Test — Pass HTTP 200'
+    needs: changes
+    if: needs.changes.outputs.http_smoke_test == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/http-smoke-test
+        with:
+          url: https://api.github.com/zen
+          expected_status: "200"
+          retries: "0"
+
+  http-smoke-pass-glob:
+    name: 'HTTP Smoke Test — Pass Glob 2*'
+    needs: changes
+    if: needs.changes.outputs.http_smoke_test == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/http-smoke-test
+        with:
+          url: https://api.github.com/zen
+          expected_status: "2*"
+          retries: "0"
+
+  http-smoke-fail-wrong-status:
+    name: 'HTTP Smoke Test — Fail Wrong Status'
+    needs: changes
+    if: needs.changes.outputs.http_smoke_test == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: smoke
+        continue-on-error: true
+        uses: ./.github/actions/http-smoke-test
+        with:
+          url: https://api.github.com/zen
+          expected_status: "404"
+          retries: "0"
+
+      - name: Assert action failed
+        shell: bash
+        run: |
+          if [[ "${{ steps.smoke.outcome }}" != "failure" ]]; then
+            echo "::error::Expected the smoke test to fail when the status did not match, but it passed"
+            exit 1
+          fi
+          echo "PASS: action correctly exited 1 when the expected status did not match"
+
+  # ── smoke-test-collect ────────────────────────────────────────────────────
+
+  collect-all-pass:
+    name: 'Smoke Collect — All Pass'
+    needs: changes
+    if: needs.changes.outputs.smoke_collect_summary == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    outputs:
+      rows: ${{ steps.collect.outputs.rows }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: collect
+        uses: ./.github/actions/smoke-test-collect
+        with:
+          stack: test/stack
+          checks: |
+            https://example.com success
+            https://example.org success
+
+      - name: Assert two green icons
+        shell: bash
+        run: |
+          COUNT=$(echo "${{ steps.collect.outputs.rows }}" | grep -c "🟢" || true)
+          if [[ "$COUNT" -ne 2 ]]; then
+            echo "::error::Expected 2 green icons in rows, got $COUNT"
+            exit 1
+          fi
+          echo "PASS: 2 green icons in rows"
+
+  collect-blank-lines:
+    name: 'Smoke Collect — Blank Lines Skipped'
+    needs: changes
+    if: needs.changes.outputs.smoke_collect_summary == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: collect
+        uses: ./.github/actions/smoke-test-collect
+        with:
+          stack: test/stack
+          checks: |
+            check-a success
+
+            check-b success
+
+      - name: Assert exactly two rows (blank lines ignored)
+        shell: bash
+        run: |
+          COUNT=$(echo "${{ steps.collect.outputs.rows }}" | grep -c "🟢" || true)
+          if [[ "$COUNT" -ne 2 ]]; then
+            echo "::error::Expected 2 rows after blank-line filtering, got $COUNT"
+            exit 1
+          fi
+          echo "PASS: blank lines correctly skipped"
+
+  collect-one-fail:
+    name: 'Smoke Collect — One Fail (negative)'
+    needs: changes
+    if: needs.changes.outputs.smoke_collect_summary == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: collect
+        continue-on-error: true
+        uses: ./.github/actions/smoke-test-collect
+        with:
+          stack: test/stack
+          checks: |
+            check-a success
+            check-b failure
+
+      - name: Assert action failed
+        shell: bash
+        run: |
+          if [[ "${{ steps.collect.outcome }}" != "failure" ]]; then
+            echo "::error::Expected collect action to fail when a check outcome is 'failure', but it passed"
+            exit 1
+          fi
+          echo "PASS: action correctly exited 1 when a check failed"
+
+      - name: Assert red icon in rows
+        shell: bash
+        run: |
+          if ! echo "${{ steps.collect.outputs.rows }}" | grep -q "🔴"; then
+            echo "::error::Expected a red icon in rows for the failed check"
+            exit 1
+          fi
+          echo "PASS: red icon present for failed check"
+
+  # ── smoke-test-summary ────────────────────────────────────────────────────
+
+  summary-pass:
+    name: 'Smoke Summary — All Passed'
+    needs: [changes, collect-all-pass]
+    if: needs.changes.outputs.smoke_collect_summary == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/smoke-test-summary
+        with:
+          rows: ${{ needs.collect-all-pass.outputs.rows }}
+          all_passed: ${{ needs.collect-all-pass.result == 'success' && 'true' || 'false' }}
+          pull_request_number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+          token: ${{ github.token }}
+
+  summary-fail:
+    name: 'Smoke Summary — Not All Passed (negative)'
+    needs: changes
+    if: needs.changes.outputs.smoke_collect_summary == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: summary
+        continue-on-error: true
+        uses: ./.github/actions/smoke-test-summary
+        with:
+          rows: "| test/stack | check-a | 🔴 |"
+          all_passed: 'false'
+
+      - name: Assert action failed
+        shell: bash
+        run: |
+          if [[ "${{ steps.summary.outcome }}" != "failure" ]]; then
+            echo "::error::Expected summary action to fail when all_passed is 'false', but it passed"
+            exit 1
+          fi
+          echo "PASS: action correctly exited 1 when all_passed was false"
+
+  # ── scheduled-tag-release ─────────────────────────────────────────────────
+
+  tag-release-daily:
+    name: 'Scheduled Tag Release — Daily dry run'
+    needs: changes
+    if: needs.changes.outputs.scheduled_tag_release == 'true' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/scheduled-tag-release.yml
+    with:
+      runner: ubuntu-latest
+      cadence: daily
+      dry_run: true
+
+  tag-release-weekly:
+    name: 'Scheduled Tag Release — Weekly dry run'
+    needs: changes
+    if: needs.changes.outputs.scheduled_tag_release == 'true' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/scheduled-tag-release.yml
+    with:
+      runner: ubuntu-latest
+      cadence: weekly
+      dry_run: true
+
+  # ── terraform-required-check ─────────────────────────────────────────────
+
+  tf-check-gate-pass-success:
+    name: 'TF Required Check — Gate passes on success'
+    needs: changes
+    if: needs.changes.outputs.terraform_summary == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/terraform-required-check.yml
+    with:
+      terraform_infra_result: success
+      pull_request_number: 0
+
+  tf-check-gate-pass-skipped:
+    name: 'TF Required Check — Gate passes on skipped'
+    needs: changes
+    if: needs.changes.outputs.terraform_summary == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/terraform-required-check.yml
+    with:
+      terraform_infra_result: skipped
+      pull_request_number: 0
+
+  tf-check-comment:
+    name: 'TF Required Check — Creates or updates PR comment'
+    needs: changes
+    if: >-
+      (needs.changes.outputs.terraform_summary == 'true' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    uses: ./.github/workflows/terraform-required-check.yml
+    with:
+      terraform_infra_result: success
+      pull_request_number: ${{ github.event.pull_request.number }}
+
+  tf-check-verify-comment:
+    name: 'TF Required Check — Verify PR comment marker and heading'
+    needs: [changes, tf-check-comment]
+    if: >-
+      always() &&
+      needs.tf-check-comment.result == 'success' &&
+      (needs.changes.outputs.terraform_summary == 'true' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Verify comment has correct marker and heading
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          COMMENT_BODY=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- terraform-required-check-summary -->"))] | last | .body // empty')
+          if [[ -z "$COMMENT_BODY" ]]; then
+            echo "::error::No terraform-required-check-summary comment found on PR #${PR_NUMBER}"
+            exit 1
+          fi
+          if ! echo "$COMMENT_BODY" | grep -qF "🚀 Terraform Summary"; then
+            echo "::error::Comment does not contain '🚀 Terraform Summary'"
+            echo "--- comment body ---"
+            echo "$COMMENT_BODY"
+            exit 1
+          fi
+          echo "PASS: PR comment found with correct marker and '🚀 Terraform Summary' heading"
+
+  # ── Gate — branch protection required check ───────────────────────────────
+
+  test:
+    name: Tests
+    needs:
+      - http-smoke-pass-200
+      - http-smoke-pass-glob
+      - http-smoke-fail-wrong-status
+      - collect-all-pass
+      - collect-blank-lines
+      - collect-one-fail
+      - summary-pass
+      - summary-fail
+      - tag-release-daily
+      - tag-release-weekly
+      - tf-check-gate-pass-success
+      - tf-check-gate-pass-skipped
+      - tf-check-verify-comment
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fail when any test job failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::One or more test jobs failed or were cancelled"
+          exit 1
+      - run: echo "All test jobs passed or were skipped ✓"

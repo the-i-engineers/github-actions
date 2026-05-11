@@ -1,0 +1,714 @@
+name: Terraform Stack
+
+# Reusable workflow for a single Terraform stack (one environment/platform cell).
+#
+# Interface convention:
+#   inputs  — control workflow behaviour (environment, platform, runner, approvers, …)
+#   secrets — all authentication credentials and stack-specific secret TF_VARs
+#
+# Non-secret Terraform variables live in <environment>/<platform>/*.auto.tfvars.json
+# files committed to the calling repository. Do not pass them via workflow inputs.
+# Exception: provider/auth connection variables (region, tenancy, fingerprint, user)
+# are passed as workflow secrets and exported as TF_VAR_* for bootstrap.
+#
+# Stack-specific secret TF_VARs (e.g. preshared keys, passwords) are passed via the
+# optional tf_secrets_json secret — a JSON object written to ci-secrets.auto.tfvars.json
+# (mode 600) in the stack working directory and deleted after the job completes.
+#
+# Naming convention for stack-specific secrets in GitHub Actions:
+#   <ENVIRONMENT>_<STACK>_<SECRET_NAME>  (all uppercase)
+# Examples:
+#   NONPROD_HUB_TIE_PRESHARED_KEY, NONPROD_PLATFORM_DEV_ADB_ADMIN_PW
+#
+# Use toJSON() per value in the caller to handle any special characters safely:
+#   secrets:
+#     tf_secrets_json: >-
+#       {"tie_preshared_key": ${{ toJSON(secrets.NONPROD_HUB_TIE_PRESHARED_KEY) }},
+#        "other_secret":      ${{ toJSON(secrets.NONPROD_HUB_OTHER_SECRET) }}}
+# toJSON() properly escapes newlines, quotes, and backslashes in the value.
+#
+# Full operator guide: docs/oci/terraform-secrets-and-variables.md
+#
+# Example calling workflow (one job per stack):
+#   jobs:
+#     hub:
+#       uses: the-i-engineers/github-actions/.github/workflows/terraform-stack.yml@vX.Y.Z
+#       with:
+#         environment:          nonprod
+#         platform:             hub
+#         runner:               ${{ vars.REPOSITORY_RUNNER }}
+#         approver_app_id:      ${{ vars.APPROVER_APP_ID }}
+#         private_modules_org:  my-org   # omit if no private Terraform modules are used
+#       secrets:
+#         OCI_REGION:                  ${{ vars.OCI_REGION }}
+#         OCI_TENANCY:                 ${{ vars.OCI_TENANCY }}
+#         OCI_FINGERPRINT:             ${{ vars.OCI_FINGERPRINT }}
+#         OCI_USER:                    ${{ vars.OCI_USER }}
+#         OCI_PROFILE_NAME:            ${{ vars.OCI_PROFILE_NAME }}
+#         OCI_PRIVATE_KEY_B64:         ${{ secrets.OCI_PRIVATE_KEY_B64 }}
+#         AWS_ACCESS_KEY_ID:           ${{ vars.AWS_ACCESS_KEY_ID }}
+#         AWS_SECRET_ACCESS_KEY:       ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#         GH_TOKEN_PRIVATE_MODULES:    ${{ secrets.GH_TOKEN_PRIVATE_MODULES }}
+#         APPROVER_APP_PRIVATE_KEY:    ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
+#         tf_secrets_json: >-
+#           {"tie_preshared_key": ${{ toJSON(secrets.NONPROD_HUB_TIE_PRESHARED_KEY) }}}
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: 'Terraform environment name (e.g. nonprod, prod)'
+      platform:
+        required: true
+        type: string
+        description: 'Terraform platform/stack name (e.g. landingzone, hub, platform_dev)'
+      terraform_version:
+        required: false
+        type: string
+        default: '1.14.5'
+      runner:
+        required: true
+        type: string
+        description: 'GitHub Actions runner label (vars.REPOSITORY_RUNNER in the calling repo)'
+      approvers:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated GitHub usernames or team slugs allowed to approve the plan. Org team slugs require approver_app_id.'
+      private_modules_org:
+        required: false
+        type: string
+        default: ''
+        description: 'GitHub organisation that owns private Terraform modules. When set, authenticates git to access private modules via GH_TOKEN_PRIVATE_MODULES. Leave empty if all modules are public.'
+      approver_app_id:
+        required: false
+        type: string
+        default: ''
+        # Despite the name, this must be the GitHub App *Client ID* (the alphanumeric
+        # "Iv1.…" string shown in the App's "General" settings page), NOT the numeric
+        # App ID. actions/create-github-app-token v1+ expects the Client ID via its
+        # `client-id` input; the old numeric `app-id` input is deprecated.
+        description: 'GitHub App Client ID for resolving org team members. Required when approvers contains an org/team slug. Set vars.APPROVER_APP_ID in the calling repo.'
+      exclude_self_approval:
+        required: false
+        type: string
+        default: 'true'
+        description: 'Whether to exclude the workflow initiator from the approver list'
+      approval_timeout_minutes:
+        required: false
+        type: number
+        default: 60
+      pull_request_number:
+        required: false
+        type: number
+        default: 0
+        description: 'PR number for posting the plan-ready comment. Pass github.event.pull_request.number. 0 skips the comment (non-PR events).'
+    secrets:
+      OCI_REGION:
+        required: true
+      OCI_TENANCY:
+        required: true
+      OCI_FINGERPRINT:
+        required: true
+      OCI_USER:
+        required: true
+      OCI_PROFILE_NAME:
+        required: true
+      OCI_PRIVATE_KEY_B64:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      GH_TOKEN_PRIVATE_MODULES:
+        required: false
+        description: 'GitHub token with repo scope for reading private Terraform modules. Required when private_modules_org is set.'
+      tf_secrets_json:
+        required: false
+        description: >
+          Optional JSON object of secret Terraform variable values.
+          Written to ci-secrets.auto.tfvars.json in the stack working directory.
+          Keys are Terraform variable names; values are the secret values.
+          See workflow header comment for usage and escaping constraints.
+      APPROVER_APP_PRIVATE_KEY:
+        required: false
+        description: 'Private key PEM for the GitHub App set in approver_app_id. Required when approver_app_id is set.'
+      TEAMS_WEBHOOK_URL:
+        required: false
+        description: >
+          Optional Microsoft Teams Workflows incoming webhook URL.
+          When set, posts an Adaptive Card notification to the Teams channel as soon as
+          an approval issue is created. Set as an org-level GitHub Actions secret
+          (TEAMS_WEBHOOK_URL) so all oci-landing-zone repos inherit it automatically.
+
+jobs:
+  terraform_infra:
+    name: "Terraform Infrastructure Change Management"
+    # Dependabot PRs run with a read-only token and no repository secrets.
+    # Skip the entire job so the caller receives result: skipped, which the
+    # terraform-required-check aggregator already treats as a passing gate.
+    if: github.actor != 'dependabot[bot]'
+    # Note: environment: is intentionally omitted. It would resolve against environments
+    # in the infrastructure repository (where this reusable workflow lives), not the
+    # calling repository. If GitHub environment protection rules are required, create
+    # matching <env>/<platform> environments in the infrastructure repository.
+    runs-on: ${{ inputs.runner }}
+    env:
+      PLAN_TITLE: "Terraform '${{ inputs.environment }}/${{ inputs.platform }}'"
+      TF_LOG: WARN
+      TF_INPUT: false
+      TF_VAR_private_key_path: ~/.oci/key.pem
+      TF_VAR_region:           ${{ secrets.OCI_REGION }}
+      TF_VAR_tenancy_ocid:     ${{ secrets.OCI_TENANCY }}
+      TF_VAR_fingerprint:      ${{ secrets.OCI_FINGERPRINT }}
+      TF_VAR_user_ocid:        ${{ secrets.OCI_USER }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.environment }}/${{ inputs.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Compute stack identifier
+        id: stack_id
+        run: |
+          # Normalise environment/platform into a safe artifact-name identifier
+          # e.g. "nonprod/spokes/tie" → "nonprod-spokes-tie"
+          echo "id=$(printf '%s-%s' '${{ inputs.environment }}' '${{ inputs.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Check for Changes
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            changes:
+              - '${{ inputs.environment }}/${{ inputs.platform }}/**/*'
+              - .github/workflows/**/*
+
+      - name: Setup Terraform
+        if: steps.filter.outputs.changes == 'true'
+        uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Write secret Terraform variables
+        if: steps.filter.outputs.changes == 'true'
+        env:
+          TF_SECRETS_JSON: ${{ secrets.tf_secrets_json }}
+        run: |
+          set -euo pipefail
+          [[ -z "$TF_SECRETS_JSON" ]] && exit 0
+          jq -e 'type == "object"' <<< "$TF_SECRETS_JSON" > /dev/null || {
+            echo "::error::secrets.tf_secrets_json must be a valid JSON object."
+            exit 1
+          }
+          umask 077
+          jq '.' <<< "$TF_SECRETS_JSON" > ci-secrets.auto.tfvars.json
+
+      - name: Setup credentials
+        if: steps.filter.outputs.changes == 'true'
+        env:
+          OCI_PROFILE:         ${{ secrets.OCI_PROFILE_NAME }}
+          OCI_PRIVATE_KEY_B64: ${{ secrets.OCI_PRIVATE_KEY_B64 }}
+          AWS_AK_ID:           ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_AK_SECRET:       ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.oci ~/.aws
+
+          printf '%s' "$OCI_PRIVATE_KEY_B64" | base64 --decode > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+
+          cat > ~/.oci/config <<EOF
+          [$OCI_PROFILE]
+          user=$TF_VAR_user_ocid
+          fingerprint=$TF_VAR_fingerprint
+          key_file=~/.oci/key.pem
+          region=$TF_VAR_region
+          tenancy=$TF_VAR_tenancy_ocid
+          EOF
+          chmod 600 ~/.oci/config
+
+          cat > ~/.aws/credentials <<EOF
+          [$OCI_PROFILE]
+          aws_access_key_id=$AWS_AK_ID
+          aws_secret_access_key=$AWS_AK_SECRET
+          request_checksum_calculation=when_required
+          response_checksum_validation=when_required
+          EOF
+          chmod 600 ~/.aws/credentials
+
+      - name: Authenticate for private module
+        if: steps.filter.outputs.changes == 'true' && inputs.private_modules_org != ''
+        uses: philips-labs/terraform-private-modules-action@04ce7045452099f16c22a8dfdf83d6ca5a42db4b # v1.2
+        with:
+          org: ${{ inputs.private_modules_org }}
+          token: ${{ secrets.GH_TOKEN_PRIVATE_MODULES }}
+
+      - name: Terraform Validate and Format Check
+        if: steps.filter.outputs.changes == 'true'
+        id: init
+        run: |
+          terraform init
+          terraform validate
+          terraform fmt -check
+
+      - name: Setup tflint
+        if: steps.filter.outputs.changes == 'true'
+        uses: terraform-linters/setup-tflint@b480b8fcdaa6f2c577f8e4fa799e89e756bb7c93 # v6.2.2
+
+      - name: Run tflint
+        if: steps.filter.outputs.changes == 'true'
+        run: |
+          # Use caller-supplied .tflintrc.hcl at repo root if present; otherwise
+          # write a minimal default config to a temp file so this workflow stays
+          # self-contained (infrastructure repo itself has no Terraform code).
+          if [ -f "${GITHUB_WORKSPACE}/.tflintrc.hcl" ]; then
+            TFLINT_CONFIG="${GITHUB_WORKSPACE}/.tflintrc.hcl"
+          else
+            TFLINT_CONFIG="$(mktemp /tmp/tflintrc-XXXXXX.hcl)"
+            cat > "${TFLINT_CONFIG}" <<'TFLINTEOF'
+          config {
+            format           = "compact"
+            call_module_type = "none"
+          }
+          plugin "terraform" {
+            enabled = true
+            preset  = "recommended"
+          }
+          TFLINTEOF
+          fi
+          tflint --config "${TFLINT_CONFIG}" --init
+          tflint --config "${TFLINT_CONFIG}" --format=compact
+
+      - name: Run trivy IaC scan
+        if: steps.filter.outputs.changes == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.environment }}/${{ inputs.platform }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Terraform Plan
+        if: steps.filter.outputs.changes == 'true'
+        id: plan
+        run: |
+          set -euo pipefail
+          terraform plan -no-color -out=plan.out | tee plan.log
+          echo "plan=$(grep 'Plan: ' plan.log || true)" >> "$GITHUB_OUTPUT"
+          terraform show -no-color plan.out > plan.show
+
+      - name: Upload plan log
+        if: steps.plan.outcome == 'success'
+        id: upload_plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plan-${{ steps.stack_id.outputs.id }}
+          path: |
+            ${{ inputs.environment }}/${{ inputs.platform }}/plan.log
+            ${{ inputs.environment }}/${{ inputs.platform }}/plan.show
+          if-no-files-found: error
+
+      - name: Comment on PR — plan ready, approval pending
+        if: steps.plan.outputs.plan != '' && inputs.pull_request_number != 0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          S_PR_NUMBER:    ${{ inputs.pull_request_number }}
+          S_PLAN_TITLE:   ${{ env.PLAN_TITLE }}
+          S_ENV:          ${{ inputs.environment }}
+          S_PLATFORM:     ${{ inputs.platform }}
+          S_PLAN_LINE:    ${{ steps.plan.outputs.plan }}
+          S_ARTIFACT_URL: ${{ steps.upload_plan.outputs.artifact-url }}
+        with:
+          script: |
+            const prNumber    = parseInt(process.env.S_PR_NUMBER, 10);
+            const issueTitle  = process.env.S_PLAN_TITLE;
+            const env         = process.env.S_ENV;
+            const platform    = process.env.S_PLATFORM;
+            const planLine    = (process.env.S_PLAN_LINE || '').replace(/^Plan:\s*/, '');
+            const artifactUrl = process.env.S_ARTIFACT_URL || '';
+            const runUrl      = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const searchUrl   = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/issues?q=${encodeURIComponent(`is:issue is:open "${issueTitle}"`)}`;
+
+            const MARKER = `<!-- tf-plan-comment:${env}/${platform} -->`;
+
+            const artifactRow = artifactUrl
+              ? `[plan.log / plan.show](${artifactUrl})`
+              : '_upload unavailable_';
+
+            const body = [
+              MARKER,
+              `### 🔍 Terraform Plan Ready — \`${issueTitle}\``,
+              ``,
+              `**${planLine}**`,
+              ``,
+              `| | Link |`,
+              `|---|---|`,
+              `| 📋 Plan artifact  | ${artifactRow} |`,
+              `| ⚙️ Workflow run   | [View run](${runUrl}) |`,
+              `| ✅ Approval issue | [Find open issue](${searchUrl}) |`,
+              ``,
+              `> **Action required:** an approval issue titled \`${issueTitle}\` is being created.`,
+              `> Open the issue, review the plan, and comment \`apply\` or  \`deny\`.`,
+            ].join('\n');
+
+            let existing = null;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+            )) {
+              const found = comments.find(c => c.body && c.body.trimStart().startsWith(MARKER));
+              if (found) { existing = found; break; }
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+
+      - name: Generate approver app token
+        id: app_token
+        if: steps.plan.outputs.plan != '' && inputs.approver_app_id != ''
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          # approver_app_id holds the Client ID ("Iv1.…"), not the numeric App ID.
+          # The interface name is kept for backwards compatibility with existing callers.
+          client-id: ${{ inputs.approver_app_id }}
+          private-key: ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Notify Teams — approval required
+        if: steps.plan.outputs.plan != ''
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          S_PLAN_TITLE: ${{ env.PLAN_TITLE }}
+          S_PLAN_LINE:  ${{ steps.plan.outputs.plan }}
+          S_REPO:       ${{ github.repository }}
+          S_SHA:        ${{ github.sha }}
+          S_RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          S_REPO_URL:   ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ -z "${TEAMS_WEBHOOK_URL}" ]] && exit 0
+
+          PLAN_CHANGES="${S_PLAN_LINE#Plan: }"
+          SHA_SHORT="${S_SHA:0:7}"
+          REPO_NAME="${S_REPO##*/}"
+          ENCODED_QUERY=$(printf 'is:issue is:open "%s"' "${S_PLAN_TITLE}" | jq -Rr @uri)
+          ISSUE_URL="${S_REPO_URL}/issues?q=${ENCODED_QUERY}"
+
+          PAYLOAD=$(jq -nc \
+            --arg title    "${S_PLAN_TITLE}" \
+            --arg changes  "${PLAN_CHANGES}" \
+            --arg repo     "${REPO_NAME}" \
+            --arg sha      "${SHA_SHORT}" \
+            --arg run_url  "${S_RUN_URL}" \
+            --arg iss_url  "${ISSUE_URL}" \
+            '{
+              "type": "message",
+              "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                  "type": "AdaptiveCard",
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "version": "1.2",
+                  "body": [
+                    {
+                      "type": "TextBlock",
+                      "text": ("🔍 Terraform Approval Required — " + $title),
+                      "weight": "Bolder",
+                      "size": "Medium",
+                      "wrap": true
+                    },
+                    {
+                      "type": "FactSet",
+                      "facts": [
+                        {"title": "Changes", "value": $changes},
+                        {"title": "Repo",    "value": $repo},
+                        {"title": "Commit",  "value": $sha}
+                      ]
+                    }
+                  ],
+                  "actions": [
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "Open Approval Issue",
+                      "url": $iss_url
+                    },
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "View Workflow Run",
+                      "url": $run_url
+                    }
+                  ]
+                }
+              }]
+            }')
+
+          curl -sS --fail-with-body \
+            -X POST "${TEAMS_WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}"
+
+      - name: Approval
+        id: approval
+        timeout-minutes: ${{ inputs.approval_timeout_minutes }}
+        if: steps.plan.outputs.plan != ''
+        uses: trstringer/manual-approval@74d99dff7380e3e4b122d4ededcbca2b6ce59367 # v1.12.0
+        with:
+          secret: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
+          approvers: ${{ inputs.approvers }}
+          minimum-approvals: 1
+          issue-title: "${{ env.PLAN_TITLE }}"
+          issue-body: |
+            ${{ steps.plan.outputs.plan }}
+
+            Commit: ${{ github.sha }}
+            [Download full plan log](${{ steps.upload_plan.outputs.artifact-url }})
+          additional-approved-words: apply
+          exclude-workflow-initiator-as-approver: ${{ inputs.exclude_self_approval }}
+
+      - name: Re-plan before apply
+        id: replan
+        if: steps.plan.outputs.plan != ''
+        run: |
+          set -uo pipefail
+
+          # Run terraform plan; capture exit code without failing immediately.
+          # Exit 0 = no changes, exit 1 = error, exit 2 = changes present.
+          set +e
+          terraform plan -detailed-exitcode -no-color -out=replan.out 2>&1 | tee replan.log
+          TF_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$TF_EXIT" -eq 1 ]; then
+            echo "::error::Re-plan failed with an error — see replan.log"
+            exit 1
+          fi
+
+          terraform show -no-color replan.out > replan.show
+
+          if ! diff -q plan.show replan.show > /dev/null 2>&1; then
+            echo "::error::Plan changed since approval — re-run the workflow to generate a fresh plan"
+            diff plan.show replan.show || true
+            exit 1
+          fi
+
+          echo "Re-plan matches approved plan. Proceeding with apply."
+
+      - name: Upload re-plan log on divergence
+        if: failure() && steps.replan.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: replan-${{ steps.stack_id.outputs.id }}
+          path: ${{ inputs.environment }}/${{ inputs.platform }}/replan.log
+          if-no-files-found: warn
+
+      - name: Terraform Apply
+        id: apply
+        if: steps.plan.outputs.plan != ''
+        run: |
+          set -euo pipefail
+          terraform apply -auto-approve -no-color replan.out 2>&1 | tee apply.log
+
+      - name: Upload apply log
+        id: upload_apply
+        if: always() && steps.apply.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apply-${{ steps.stack_id.outputs.id }}
+          path: ${{ inputs.environment }}/${{ inputs.platform }}/apply.log
+          if-no-files-found: warn
+
+      - name: Parse apply log
+        id: parse_apply
+        if: always() && steps.apply.outcome != 'skipped'
+        run: |
+          set -euo pipefail
+          LOG=apply.log
+
+          CREATED=$(grep -c  'Creation complete'      "$LOG" 2>/dev/null || true)
+          UPDATED=$(grep -c  'Modifications complete' "$LOG" 2>/dev/null || true)
+          DESTROYED=$(grep -c 'Destruction complete'  "$LOG" 2>/dev/null || true)
+          CREATED=${CREATED:-0}
+          UPDATED=${UPDATED:-0}
+          DESTROYED=${DESTROYED:-0}
+
+          # If Terraform finished cleanly, the final summary line is present.
+          FINAL=$(grep '^Apply complete!' "$LOG" 2>/dev/null || echo "")
+          if [ -n "$FINAL" ]; then
+            echo "partial=false"      >> "$GITHUB_OUTPUT"
+            echo "summary=${FINAL}"   >> "$GITHUB_OUTPUT"
+          else
+            TOTAL=$((CREATED + UPDATED + DESTROYED))
+            if [ "$TOTAL" -gt 0 ]; then
+              echo "partial=true"     >> "$GITHUB_OUTPUT"
+              echo "summary=Partial apply: ${CREATED} created, ${UPDATED} updated, ${DESTROYED} destroyed (before failure)" >> "$GITHUB_OUTPUT"
+            else
+              echo "partial=false"    >> "$GITHUB_OUTPUT"
+              echo "summary="         >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Comment on PR — partial apply warning
+        if: >-
+          always() &&
+          steps.apply.outcome == 'failure' &&
+          steps.parse_apply.outputs.partial == 'true' &&
+          inputs.pull_request_number != 0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          S_PR_NUMBER:     ${{ inputs.pull_request_number }}
+          S_ENV:           ${{ inputs.environment }}
+          S_PLATFORM:      ${{ inputs.platform }}
+          S_SUMMARY:       ${{ steps.parse_apply.outputs.summary }}
+          S_ARTIFACT_URL:  ${{ steps.upload_apply.outputs.artifact-url }}
+        with:
+          script: |
+            const prNumber   = parseInt(process.env.S_PR_NUMBER, 10);
+            const env        = process.env.S_ENV;
+            const platform   = process.env.S_PLATFORM;
+            const summary    = process.env.S_SUMMARY || '';
+            const artifactUrl = process.env.S_ARTIFACT_URL || '';
+            const runUrl     = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const MARKER = `<!-- tf-plan-comment:${env}/${platform} -->`;
+
+            const artifactLink = artifactUrl ? `[apply.log](${artifactUrl})` : '_artifact unavailable_';
+
+            const warningBlock = [
+              ``,
+              `---`,
+              ``,
+              `⚠️ **Partial apply — manual reconciliation may be required**`,
+              ``,
+              `> ${summary}`,
+              ``,
+              `Some resources were changed before the apply failed. Review the ${artifactLink} to determine OCI state before re-running.`,
+              `[View workflow run](${runUrl})`,
+            ].join('\n');
+
+            let existing = null;
+            for await (const { data: comments } of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+            )) {
+              const found = comments.find(c => c.body && c.body.trimStart().startsWith(MARKER));
+              if (found) { existing = found; break; }
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body:       existing.body + warningBlock,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: prNumber,
+                body:         MARKER + warningBlock,
+              });
+            }
+
+      - name: Build stack status payload
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          S_ENV:               ${{ inputs.environment }}
+          S_PLATFORM:          ${{ inputs.platform }}
+          S_CHANGES:           ${{ steps.filter.outputs.changes }}
+          S_PLAN_LINE:         ${{ steps.plan.outputs.plan }}
+          S_INIT:              ${{ steps.init.outcome }}
+          S_PLAN:              ${{ steps.plan.outcome }}
+          S_APPROVAL:          ${{ steps.approval.outcome }}
+          S_REPLAN:            ${{ steps.replan.outcome }}
+          S_APPLY:             ${{ steps.apply.outcome }}
+          S_APPLY_ARTIFACT_URL: ${{ steps.upload_apply.outputs.artifact-url }}
+          S_PARTIAL:           ${{ steps.parse_apply.outputs.partial }}
+          S_PARTIAL_SUMMARY:   ${{ steps.parse_apply.outputs.summary }}
+        with:
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const payload = {
+              environment:    process.env.S_ENV,
+              platform:       process.env.S_PLATFORM,
+              changesDetected: process.env.S_CHANGES === 'true',
+              planLine:       (process.env.S_PLAN_LINE || '').trim(),
+              applyArtifactUrl: process.env.S_APPLY_ARTIFACT_URL || '',
+              outcomes: {
+                init:     process.env.S_INIT,
+                plan:     process.env.S_PLAN,
+                approval: process.env.S_APPROVAL,
+                replan:   process.env.S_REPLAN,
+                apply:    process.env.S_APPLY,
+              },
+            };
+
+            const partial        = process.env.S_PARTIAL === 'true';
+            const partialSummary = (process.env.S_PARTIAL_SUMMARY || '').trim();
+
+            if (!payload.changesDetected) {
+              payload.category = 'skipped';
+              payload.detail   = 'no changes committed';
+            } else if (payload.outcomes.init && payload.outcomes.init !== 'success') {
+              payload.category = 'failure';
+              payload.detail   = 'validation failure';
+            } else if (payload.outcomes.plan && payload.outcomes.plan !== 'success') {
+              payload.category = 'failure';
+              payload.detail   = 'plan failed';
+            } else if (!payload.planLine) {
+              payload.category = 'no_changes';
+              payload.detail   = 'plan reveals no delta';
+            } else if (payload.outcomes.approval && payload.outcomes.approval !== 'success') {
+              payload.category = 'failure';
+              payload.detail   = 'no approval';
+            } else if (payload.outcomes.replan && payload.outcomes.replan !== 'success') {
+              payload.category = 'failure';
+              payload.detail   = 'plan changed since approval';
+            } else if (payload.outcomes.apply && payload.outcomes.apply !== 'success') {
+              payload.category = 'failure';
+              payload.detail   = partial
+                ? `apply failed — ${partialSummary}`
+                : 'apply failed';
+              if (partial) payload.partialApplySummary = partialSummary;
+            } else {
+              payload.category = 'applied';
+              payload.detail   = payload.planLine;
+            }
+
+            const outPath = path.join(process.env.GITHUB_WORKSPACE, 'stack-status.json');
+            fs.writeFileSync(outPath, JSON.stringify(payload, null, 2));
+            core.info(`Written: ${outPath} — category: ${payload.category}`);
+
+      - name: Upload stack status payload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stack-status-${{ steps.stack_id.outputs.id }}
+          path: stack-status.json
+          if-no-files-found: error
+
+      - name: Clean up secret Terraform variables file
+        if: always()
+        run: rm -f ci-secrets.auto.tfvars.json

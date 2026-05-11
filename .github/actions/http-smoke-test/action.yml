@@ -1,0 +1,84 @@
+name: HTTP Smoke Test
+description: >
+  Perform an HTTP health check against a URL and verify the response status code.
+  Retries on failure with a configurable delay. Supports disabling TLS certificate
+  verification for self-signed or imported-CA certificates.
+
+inputs:
+  url:
+    description: URL to test.
+    required: true
+  expected_status:
+    description: >
+      Space-separated list of accepted HTTP status codes or bash glob patterns.
+      Examples: "200", "3*" (any 3xx), "200 302".
+    required: false
+    default: "200"
+  insecure:
+    description: >
+      Disable TLS certificate verification (-k flag). Use when the certificate is
+      self-signed or only valid via an imported CA. Remove once a trusted CA cert
+      is in place.
+    required: false
+    default: "false"
+  retries:
+    description: Number of retry attempts after the initial failure.
+    required: false
+    default: "2"
+  retry_delay_seconds:
+    description: Seconds to wait between retry attempts.
+    required: false
+    default: "15"
+
+runs:
+  using: composite
+  steps:
+    - name: Check ${{ inputs.url }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        INSECURE_FLAG=""
+        if [[ "${{ inputs.insecure }}" == "true" ]]; then
+          INSECURE_FLAG="-k"
+        fi
+
+        MAX_ATTEMPTS=$(( ${{ inputs.retries }} + 1 ))
+        ATTEMPT=0
+        PASSED=false
+
+        while [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
+          ATTEMPT=$(( ATTEMPT + 1 ))
+
+          if STATUS=$(curl $INSECURE_FLAG -sS -o /dev/null -w '%{http_code}' --max-time 10 '${{ inputs.url }}'); then
+            MATCHED=false
+            for EXPECTED in ${{ inputs.expected_status }}; do
+              # Intentional glob match — $EXPECTED must not be quoted.
+              # shellcheck disable=SC2254
+              if [[ "$STATUS" == $EXPECTED ]]; then
+                MATCHED=true
+                break
+              fi
+            done
+
+            if [[ "$MATCHED" == "true" ]]; then
+              echo "PASS (attempt $ATTEMPT/$MAX_ATTEMPTS): ${{ inputs.url }} → HTTP $STATUS"
+              PASSED=true
+              break
+            else
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: ${{ inputs.url }} → HTTP $STATUS (expected: ${{ inputs.expected_status }})"
+            fi
+          else
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: curl failed for ${{ inputs.url }}"
+          fi
+
+          if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
+            echo "Retrying in ${{ inputs.retry_delay_seconds }}s..."
+            sleep ${{ inputs.retry_delay_seconds }}
+          fi
+        done
+
+        if [[ "$PASSED" != "true" ]]; then
+          echo "FAIL: ${{ inputs.url }} did not return expected status after $MAX_ATTEMPTS attempt(s)"
+          exit 1
+        fi

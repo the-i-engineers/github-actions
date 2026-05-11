@@ -1,0 +1,85 @@
+name: Smoke Test Summary
+description: >
+  Post a PR comment with an infrastructure smoke test results table and fail
+  the job if any upstream check job did not succeed. Works with any test type
+  whose results were collected via smoke-test-collect.
+
+inputs:
+  rows:
+    description: >
+      Markdown table rows to include in the summary, one per line.
+      Typically assembled from job outputs using needs.<job>.outputs.rows.
+    required: true
+  pull_request_number:
+    description: >
+      PR number for posting the summary as a PR comment.
+      Leave empty for non-PR runs (scheduled, workflow_dispatch).
+    required: false
+    default: ''
+  repository:
+    description: >
+      GitHub repository in owner/repo format, used when posting the PR comment.
+      Defaults to the current repository.
+    required: false
+    default: ${{ github.repository }}
+  all_passed:
+    description: >
+      Set to 'true' if all upstream smoke test jobs succeeded, 'false'
+      otherwise. The action exits non-zero when this is not 'true'.
+      Example caller expression: needs.job_a.result == 'success' && needs.job_b.result == 'success'
+    required: true
+  token:
+    description: >
+      GitHub token with pull-requests:write permission, used to post the PR
+      comment. Only required when pull_request_number is set.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Post PR comment
+      if: inputs.pull_request_number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        ROWS: ${{ inputs.rows }}
+        PR_NUMBER: ${{ inputs.pull_request_number }}
+        REPOSITORY: ${{ inputs.repository }}
+      run: |
+        MARKER='<!-- infrastructure-smoke-tests-summary -->'
+
+        {
+          echo "$MARKER"
+          echo "## 🔬 Infrastructure Smoke Tests"
+          echo ""
+          echo "| Stack | Test | Result |"
+          echo "|-------|------|--------|"
+          printf '%s\n' "$ROWS" | sed '/^[[:space:]]*$/d'
+        } > /tmp/smoke-summary.md
+
+        # Find the most recent bot-authored marker comment (handles retries without duplicating)
+        EXISTING_ID=$(gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          --paginate \
+          --jq ".[] | select((.body | contains(\"${MARKER}\")) and .user.login == \"github-actions[bot]\") | .id" \
+          | tail -n 1)
+
+        PAYLOAD=$(jq -n --rawfile body /tmp/smoke-summary.md '{"body": $body}')
+
+        if [[ -n "$EXISTING_ID" ]]; then
+          echo "$PAYLOAD" | gh api "repos/${REPOSITORY}/issues/comments/${EXISTING_ID}" -X PATCH --input -
+        else
+          echo "$PAYLOAD" | gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -X POST --input -
+        fi
+
+    - name: Evaluate results
+      if: always()
+      shell: bash
+      env:
+        ALL_PASSED: ${{ inputs.all_passed }}
+      run: |
+        if [[ "$ALL_PASSED" != "true" ]]; then
+          echo "One or more smoke test jobs failed"
+          exit 1
+        fi
+        echo "PASS: all smoke test jobs succeeded"

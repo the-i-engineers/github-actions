@@ -1,0 +1,214 @@
+name: Terraform Required Check
+
+# Reusable required-check aggregator for Terraform stack workflows.
+# Callers pass the aggregated result of their stack jobs and the PR number
+# so this workflow can post the summary comment and enforce the gate.
+#
+# Example usage:
+#   terraform_required_check:
+#     needs: [landingzone, hub, platform_dev]
+#     if: always()
+#     uses: the-i-engineers/github-actions/.github/workflows/terraform-required-check.yml@vX.Y.Z
+#     with:
+#       terraform_infra_result: >-
+#         ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 'failure' || contains(needs.*.result, 'skipped') && 'skipped' || 'success' }}
+#       pull_request_number:    ${{ github.event.pull_request.number }}
+
+on:
+  workflow_call:
+    inputs:
+      terraform_infra_result:
+        required: true
+        type: string
+        description: 'Result of the terraform_infra job (success, failure, cancelled, skipped)'
+      pull_request_number:
+        required: false
+        type: number
+        default: 0
+        description: 'PR number for posting the summary comment. Pass github.event.pull_request.number. 0 skips the comment (non-PR events).'
+      runner:
+        required: false
+        type: string
+        default: ''
+        description: 'Deprecated — no longer used. The job runs on ubuntu-latest. Kept for backward compatibility with existing callers.'
+
+jobs:
+  terraform_required_check:
+    name: "Terraform Required Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download stack status payloads
+        if: always()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: stack-status-*
+          path: stack-status
+
+      - name: Summarize stack completion
+        run: |
+          echo "### Terraform Stack Completion" >> "$GITHUB_STEP_SUMMARY"
+          echo "- terraform_infra result: \`${{ inputs.terraform_infra_result }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final summary comment
+        if: inputs.pull_request_number != 0 && github.actor != 'dependabot[bot]'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          S_PR_NUMBER: ${{ inputs.pull_request_number }}
+          S_RESULT:    ${{ inputs.terraform_infra_result }}
+          S_RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          S_SHA:       ${{ github.sha }}
+        with:
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const MARKER  = '<!-- terraform-required-check-summary -->';
+            const rootDir = path.join(process.env.GITHUB_WORKSPACE, 'stack-status');
+
+            const statusFiles = [];
+            if (fs.existsSync(rootDir)) {
+              // When only 1 artifact matched the pattern, download-artifact places
+              // the file directly in rootDir (no artifact-name subdirectory).
+              // When multiple artifacts matched, each gets its own subdirectory.
+              // Handle both cases.
+              const direct = path.join(rootDir, 'stack-status.json');
+              if (fs.existsSync(direct)) statusFiles.push(direct);
+
+              for (const dirent of fs.readdirSync(rootDir, { withFileTypes: true })) {
+                if (!dirent.isDirectory()) continue;
+                const p = path.join(rootDir, dirent.name, 'stack-status.json');
+                if (fs.existsSync(p)) statusFiles.push(p);
+              }
+            }
+
+            const statuses = statusFiles
+              .map((f) => JSON.parse(fs.readFileSync(f, 'utf8')))
+              .sort((a, b) =>
+                `${a.environment}/${a.platform}`.localeCompare(`${b.environment}/${b.platform}`)
+              );
+
+            const totals = { skipped: 0, no_changes: 0, applied: 0, failure: 0 };
+            for (const item of statuses) {
+              if (Object.prototype.hasOwnProperty.call(totals, item.category)) {
+                totals[item.category] += 1;
+              } else {
+                totals.failure += 1;
+              }
+            }
+
+            const ICONS = { applied: '✅', no_changes: '➖', skipped: '⏭️', failure: '❌' };
+            const toRow = (item) => {
+              const stack  = `${item.environment}/${item.platform}`;
+              const icon   = ICONS[item.category] || '❓';
+              const label  = item.category.replace('_', ' ');
+              let   detail = '';
+              if (item.category === 'applied') detail = item.detail.replace(/^Plan:\s*/, '');
+              else if (item.category === 'failure') detail = item.detail;
+              const applyCell = item.applyArtifactUrl
+                ? `[apply.log](${item.applyArtifactUrl})`
+                : '—';
+              return `| \`${stack}\` | ${icon} ${label} | ${detail || '—'} | ${applyCell} |`;
+            };
+
+            const tableHeader = '| Stack | Status | Detail | Apply Log |\n|-------|--------|--------|-----------|';
+            const tableRows   = statuses.length
+              ? statuses.map(toRow).join('\n')
+              : '| — | — | No stack status payloads found | — |';
+
+            const overall     = process.env.S_RESULT;
+            const overallIcon = overall === 'success' ? '✅' : overall === 'skipped' ? '⏭️' : '❌';
+            const totalsLine  =
+              `**Applied:** ${totals.applied} · ` +
+              `**No changes:** ${totals.no_changes} · ` +
+              `**Skipped:** ${totals.skipped} · ` +
+              `**Failed:** ${totals.failure}`;
+
+            const runUrl = process.env.S_RUN_URL;
+            const sha    = (process.env.S_SHA || '').slice(0, 7);
+            const runHead = `### Run [#${context.runNumber}](${runUrl}) — \`${sha}\` — ${context.actor}`;
+
+            const thisRunSection = [
+              runHead,
+              '',
+              tableHeader,
+              tableRows,
+              '',
+              `${overallIcon} **Overall:** \`${overall}\` · ${totalsLine}`,
+            ].join('\n');
+
+            // GitHub comments are capped at 65,536 characters; limiting stored cycles
+            // prevents the accumulated body from ever approaching that boundary.
+            const MAX_CYCLES      = 10;
+            const SECTION_SEP     = '\n\n---\n\n';
+
+            const prNumber = parseInt(process.env.S_PR_NUMBER, 10);
+            if (prNumber) {
+              // Find existing summary comment; stop as soon as the single marker comment
+              // is found to avoid fetching every comment on long-lived PRs.
+              let existing = null;
+              for await (const { data: comments } of github.paginate.iterator(
+                github.rest.issues.listComments,
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+              )) {
+                for (const c of comments) {
+                  if (c.body && c.body.trimStart().startsWith(MARKER)) {
+                    existing = c;
+                    break;
+                  }
+                }
+                if (existing) break;
+              }
+
+              let newBody;
+              if (existing) {
+                // Prepend new run section; keep up to MAX_CYCLES-1 previous sections to
+                // avoid exceeding GitHub's maximum comment size over many apply cycles.
+                const prevStart = existing.body.indexOf('\n\n### Run ');
+                const prevSections = prevStart >= 0 ? existing.body.slice(prevStart + 2) : '';
+                let cappedPrev = '';
+                if (prevSections) {
+                  const sections = prevSections.split(SECTION_SEP);
+                  cappedPrev = sections.slice(0, MAX_CYCLES - 1).join(SECTION_SEP);
+                }
+                const separator = cappedPrev ? SECTION_SEP : '';
+                newBody = `${MARKER}\n## 🚀 Terraform Summary\n\n${thisRunSection}${separator}${cappedPrev}`;
+                await github.rest.issues.updateComment({
+                  owner:      context.repo.owner,
+                  repo:       context.repo.repo,
+                  comment_id: existing.id,
+                  body:       newBody,
+                });
+              } else {
+                newBody = `${MARKER}\n## 🚀 Terraform Summary\n\n${thisRunSection}`;
+                await github.rest.issues.createComment({
+                  owner:        context.repo.owner,
+                  repo:         context.repo.repo,
+                  issue_number: prNumber,
+                  body:         newBody,
+                });
+              }
+            }
+
+            // Write directly to GITHUB_STEP_SUMMARY — core.summary.addRaw() after
+            // addHeading() (HTML) disrupts the markdown context, collapsing all
+            // table newlines to a single line. Direct file append is always reliable.
+            const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+            if (summaryFile) {
+              fs.appendFileSync(
+                summaryFile,
+                `## 🚀 Terraform Summary\n\n${thisRunSection}\n`,
+                'utf8'
+              );
+            }
+
+      - name: Enforce required gate
+        run: |
+          case "${{ inputs.terraform_infra_result }}" in
+            success|skipped)
+              echo "Terraform stacks completed with acceptable result: ${{ inputs.terraform_infra_result }}"
+              ;;
+            *)
+              echo "Terraform stacks did not complete successfully: ${{ inputs.terraform_infra_result }}"
+              exit 1
+              ;;
+          esac

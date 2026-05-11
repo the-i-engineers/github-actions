@@ -1,0 +1,112 @@
+name: Smoke Test Collect
+description: >
+  Aggregate smoke check outcomes into markdown table rows and fail if any check
+  did not succeed. Test-type agnostic: works for HTTP, DNS, certificate, or any
+  check that produces a GitHub Actions step outcome.
+
+inputs:
+  stack:
+    description: >
+      Stack label for the results table (e.g. prod/platform_burg,
+      nonprod/hub). Used as the first column in every row.
+    required: true
+  checks:
+    description: >
+      Newline-separated list of "<test-label> <outcome>" pairs, one per check
+      step. The test-label can be any descriptive string — a URL, hostname,
+      or a free-form label such as "cert: example.com expires >30d". The
+      outcome is the GitHub Actions step outcome value: success, failure,
+      cancelled, or skipped. The last word on each line is treated as the
+      outcome; everything before it is the test label.
+    required: true
+
+outputs:
+  rows:
+    description: >
+      Markdown table rows generated from the checks input, one row per check,
+      in the format "| stack | test-label | 🟢/🔴 |".
+    value: ${{ steps.build.outputs.rows }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build rows
+      id: build
+      if: always()
+      shell: bash
+      env:
+        STACK: ${{ inputs.stack }}
+        CHECKS: ${{ inputs.checks }}
+      run: |
+        set -euo pipefail
+
+        ROWS=""
+        PASSED=true
+
+        # Escape pipe characters and sanitise newlines in the stack label to
+        # prevent markdown table corruption.
+        SAFE_STACK="${STACK//|/\\|}"
+        SAFE_STACK="${SAFE_STACK//$'\n'/ }"
+
+        while IFS= read -r LINE; do
+          # Skip blank lines and lines containing only whitespace
+          [[ -z "${LINE//[[:space:]]/}" ]] && continue
+
+          # Last word is the outcome; everything before it is the test label.
+          OUTCOME="${LINE##* }"
+          LABEL="${LINE% *}"
+
+          # Validate: if no space separator was found, LABEL equals LINE.
+          if [[ "$LABEL" == "$LINE" ]]; then
+            echo "::error::Malformed check line (missing space separator): '${LINE}'"
+            PASSED=false
+            continue
+          fi
+
+          # Warn on unrecognised outcome values (still treated as failure).
+          case "$OUTCOME" in
+            success|failure|cancelled|skipped) ;;
+            *) echo "::warning::Unrecognised outcome '${OUTCOME}' for '${LABEL}' — treated as failure" ;;
+          esac
+
+          if [[ "$OUTCOME" == "success" ]]; then
+            ICON="🟢"
+          else
+            ICON="🔴"
+            PASSED=false
+          fi
+
+          # Escape pipe characters and sanitise newlines in the label.
+          SAFE_LABEL="${LABEL//|/\\|}"
+          SAFE_LABEL="${SAFE_LABEL//$'\n'/ }"
+
+          # Join rows without a trailing newline so that callers concatenating
+          # multiple outputs do not get blank lines between row blocks.
+          [[ -n "$ROWS" ]] && ROWS="${ROWS}"$'\n'
+          ROWS="${ROWS}| ${SAFE_STACK} | ${SAFE_LABEL} | ${ICON} |"
+        done <<< "$CHECKS"
+
+        {
+          echo "rows<<SMOKE_ROWS"
+          # printf '%s\n' adds exactly one trailing newline, which is required
+          # so the SMOKE_ROWS delimiter appears on its own line. ROWS itself has
+          # no trailing newline (rows are joined without one above), minimising
+          # blank lines when callers concatenate multiple outputs.
+          printf '%s\n' "$ROWS"
+          echo "SMOKE_ROWS"
+          echo "passed=${PASSED}"
+        } >> "$GITHUB_OUTPUT"
+
+    # Separate step so rows output is always written before any failure.
+    - name: Fail if any check failed
+      if: always()
+      shell: bash
+      env:
+        PASSED: ${{ steps.build.outputs.passed }}
+        STACK: ${{ inputs.stack }}
+      run: |
+        if [[ "$PASSED" != "true" ]]; then
+          echo "One or more checks failed for ${STACK}"
+          exit 1
+        fi
+        echo "PASS: all checks for ${STACK} succeeded"
