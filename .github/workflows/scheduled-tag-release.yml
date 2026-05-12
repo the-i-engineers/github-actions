@@ -37,6 +37,7 @@ name: Scheduled Tag Release
 #         cadence: ${{ github.event_name == 'workflow_dispatch' && inputs.cadence || (github.event.schedule == '30 6 * * 1' && 'weekly' || 'daily') }}
 #         dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true || false }}
 #       secrets:
+#         GH_PAT: ${{ secrets.GH_PAT }}
 #         TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
 #
 # ───────────────────────────────────────────────────────────────────────────
@@ -64,6 +65,15 @@ on:
         default: false
         description: 'Print what would happen without creating tags or releases'
     secrets:
+      GH_PAT:
+        required: false
+        description: >
+          Optional Personal Access Token used to push tags and create GitHub Releases.
+          When provided, tags and releases are created under the PAT owner's identity,
+          which allows downstream workflows using `on: push: tags` to be triggered
+          (GITHUB_TOKEN-created events are suppressed by GitHub).
+          Requires 'contents: write' scope on the target repository.
+          Falls back to GITHUB_TOKEN if not provided (downstream triggers will not fire).
       TEAMS_WEBHOOK_URL:
         required: false
         description: >
@@ -86,6 +96,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
 
       - name: Validate cadence and runner compatibility
         shell: bash
@@ -148,6 +159,7 @@ jobs:
           name: ${{ steps.version.outputs.version_tag }}
           generateReleaseNotes: true
           makeLatest: true
+          token: ${{ secrets.GH_PAT || github.token }}
 
       - name: Prepare Teams payload — daily release
         if: inputs.cadence == 'daily' && steps.version.outputs.is_tagged != 'true' && !inputs.dry_run
@@ -265,6 +277,7 @@ jobs:
           name: "Weekly Summary — ${{ steps.weekly.outputs.tag }}"
           generateReleaseNotes: true
           makeLatest: false
+          token: ${{ secrets.GH_PAT || github.token }}
 
       - name: Prepare Teams payload — weekly release
         if: inputs.cadence == 'weekly' && steps.weekly.outputs.exists != 'true' && steps.weekly.outputs.has_commits == 'true' && !inputs.dry_run
