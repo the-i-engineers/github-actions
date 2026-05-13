@@ -18,14 +18,15 @@ inputs:
       outcome is the GitHub Actions step outcome value: success, failure,
       cancelled, or skipped. The last word on each line is treated as the
       outcome; everything before it is the test label.
-      Skipped checks are shown with ⏭️ and do not count as failures.
+      Skipped checks are shown with ⏭️ and cancelled checks with 🚫; neither
+      counts as a failure.
     required: true
 
 outputs:
   rows:
     description: >
       Markdown table rows generated from the checks input, one row per check,
-      in the format "| stack | test-label | 🟢/🔴/⏭️ |".
+      in the format "| stack | test-label | 🟢/🔴/⏭️/🚫 |".
     value: ${{ steps.build.outputs.rows }}
 
 runs:
@@ -75,6 +76,9 @@ runs:
           elif [[ "$OUTCOME" == "skipped" ]]; then
             ICON="⏭️"
             # skipped is intentional — do not count as failure
+          elif [[ "$OUTCOME" == "cancelled" ]]; then
+            ICON="🚫"
+            # cancelled is intentional — do not count as failure
           else
             ICON="🔴"
             PASSED=false
