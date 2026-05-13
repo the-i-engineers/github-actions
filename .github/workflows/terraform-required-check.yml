@@ -172,21 +172,22 @@ jobs:
                 }
                 const separator = cappedPrev ? SECTION_SEP : '';
                 newBody = `${MARKER}\n## 🚀 Terraform Summary\n\n${thisRunSection}${separator}${cappedPrev}`;
-                await github.rest.issues.updateComment({
+                // Delete the old comment so the updated summary appears at the bottom
+                // of the PR timeline rather than staying buried at its original position.
+                await github.rest.issues.deleteComment({
                   owner:      context.repo.owner,
                   repo:       context.repo.repo,
                   comment_id: existing.id,
-                  body:       newBody,
                 });
               } else {
                 newBody = `${MARKER}\n## 🚀 Terraform Summary\n\n${thisRunSection}`;
-                await github.rest.issues.createComment({
-                  owner:        context.repo.owner,
-                  repo:         context.repo.repo,
-                  issue_number: prNumber,
-                  body:         newBody,
-                });
               }
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: prNumber,
+                body:         newBody,
+              });
             }
 
             // Write directly to GITHUB_STEP_SUMMARY — core.summary.addRaw() after

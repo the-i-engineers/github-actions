@@ -334,7 +334,9 @@ jobs:
             const runUrl      = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const searchUrl   = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/issues?q=${encodeURIComponent(`is:issue is:open "${issueTitle}"`)}`;
 
-            const MARKER = `<!-- tf-plan-comment:${env}/${platform} -->`;
+            // Run-scoped marker so the partial-apply warning (same run) can locate
+            // this specific comment even when multiple plan comments exist on the PR.
+            const MARKER = `<!-- tf-plan-comment:${env}/${platform}:${context.runId} -->`;
 
             const artifactRow = artifactUrl
               ? `[plan.log / plan.show](${artifactUrl})`
@@ -356,30 +358,14 @@ jobs:
               `> Open the issue, review the plan, and comment \`apply\` or  \`deny\`.`,
             ].join('\n');
 
-            let existing = null;
-            for await (const { data: comments } of github.paginate.iterator(
-              github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
-            )) {
-              const found = comments.find(c => c.body && c.body.trimStart().startsWith(MARKER));
-              if (found) { existing = found; break; }
-            }
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner:      context.repo.owner,
-                repo:       context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner:        context.repo.owner,
-                repo:         context.repo.repo,
-                issue_number: prNumber,
-                body,
-              });
-            }
+            // Always create a new comment so the latest plan is visible at the
+            // bottom of the PR timeline (editing in place keeps it buried).
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
 
       - name: Generate approver app token
         id: app_token
@@ -588,7 +574,8 @@ jobs:
             const artifactUrl = process.env.S_ARTIFACT_URL || '';
             const runUrl     = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
-            const MARKER = `<!-- tf-plan-comment:${env}/${platform} -->`;
+            // Must match the run-scoped marker written by the plan-ready comment step.
+            const MARKER = `<!-- tf-plan-comment:${env}/${platform}:${context.runId} -->`;
 
             const artifactLink = artifactUrl ? `[apply.log](${artifactUrl})` : '_artifact unavailable_';
 
