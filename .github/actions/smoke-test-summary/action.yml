@@ -56,9 +56,11 @@ runs:
           echo "| Stack | Test | Result |"
           echo "|-------|------|--------|"
           printf '%s\n' "$ROWS" | sed '/^[[:space:]]*$/d'
+          echo ""
+          echo "_Legend: 🟢 passed · ⏭️ skipped · 🚫 cancelled · 🔴 failed_"
         } > /tmp/smoke-summary.md
 
-        # Find the most recent bot-authored marker comment (handles retries without duplicating)
+        # Find the most recent bot-authored marker comment.
         EXISTING_ID=$(gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
           --paginate \
           --jq ".[] | select((.body | contains(\"${MARKER}\")) and .user.login == \"github-actions[bot]\") | .id" \
@@ -66,11 +68,12 @@ runs:
 
         PAYLOAD=$(jq -n --rawfile body /tmp/smoke-summary.md '{"body": $body}')
 
+        # Delete the old comment (if any) before posting a new one so the latest
+        # smoke test results always appear at the bottom of the PR timeline.
         if [[ -n "$EXISTING_ID" ]]; then
-          echo "$PAYLOAD" | gh api "repos/${REPOSITORY}/issues/comments/${EXISTING_ID}" -X PATCH --input -
-        else
-          echo "$PAYLOAD" | gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -X POST --input -
+          gh api "repos/${REPOSITORY}/issues/comments/${EXISTING_ID}" -X DELETE
         fi
+        echo "$PAYLOAD" | gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -X POST --input -
 
     - name: Evaluate results
       if: always()
