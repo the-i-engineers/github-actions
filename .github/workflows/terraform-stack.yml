@@ -190,7 +190,7 @@ jobs:
 
       - name: Setup Terraform
         if: steps.filter.outputs.changes == 'true'
-        uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ inputs.terraform_version }}
 
@@ -371,7 +371,7 @@ jobs:
       - name: Generate approver app token
         id: app_token
         if: steps.plan.outputs.plan != '' && inputs.approver_app_id != ''
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           # approver_app_id holds the Client ID ("Iv1.…"), not the numeric App ID.
           # The interface name is kept for backwards compatibility with existing callers.
