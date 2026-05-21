@@ -2,6 +2,12 @@
 
 Reusable GitHub Actions workflows and composite actions for the [the-i-engineers](https://github.com/the-i-engineers) organisation.
 
+## Scope
+
+This repository covers **infrastructure and DevOps CI**. It is consumed by platform engineers and Terraform-managed repositories.
+
+For Java/Gradle **application CI** (build, test, publish, container image), see [`the-i-engineers/reusable-workflows`](https://github.com/the-i-engineers/reusable-workflows).
+
 ## Reusable Workflows
 
 | Workflow | Description |
