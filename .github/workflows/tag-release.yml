@@ -25,7 +25,6 @@ on:
       - .github/workflows/terraform-stack.yml
       - .github/workflows/terraform-required-check.yml
       - .github/workflows/scheduled-tag-release.yml
-      - .github/workflows/lint-pr-title.yml
 
 concurrency:
   group: tag-release
