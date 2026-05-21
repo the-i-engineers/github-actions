@@ -29,7 +29,7 @@ cd ../../worktrees/github-actions-<branch-slug>
 # work here
 ```
 
-Place worktrees in a `worktrees/` directory **beside** the `github-actions/` checkout (i.e. a sibling, not inside it).
+Place worktrees in the `worktrees/` directory that is a **sibling of the `infrastructure/` root** — not inside `github-actions/` or inside `infrastructure/`. From `infrastructure/github-actions/`, the path `../../worktrees/` reaches that sibling directory.
 
 ## Testing changes
 
@@ -43,7 +43,17 @@ Do not ship a new workflow or action without a corresponding test case in `test.
 
 ## Versioning
 
-Tags are created **automatically** by `tag-release.yml` on every push to `main` that modifies a reusable workflow or composite action file.
+Tags are created **automatically** by `tag-release.yml` on every push to `main` that modifies a file matching its `on.push.paths` filter. The current list is:
+
+```
+.github/actions/**
+.github/workflows/terraform-stack.yml
+.github/workflows/terraform-required-check.yml
+.github/workflows/scheduled-tag-release.yml
+.github/workflows/lint-pr-title.yml
+```
+
+> **Important:** adding a new reusable workflow file will **not** trigger auto-tagging unless you also add its path to the `on.push.paths` list in `tag-release.yml`. Internal-only workflows (e.g. `test.yml`, `lint-workflows.yml`, `tag-release.yml` itself) are intentionally excluded.
 
 Bump rules follow [Conventional Commits](docs/contributing/conventional-commits.md):
 
@@ -78,10 +88,10 @@ Breaking changes: append `!` to the type or add `BREAKING CHANGE:` in the commit
 ## Adding a new reusable workflow
 
 1. Create `.github/workflows/<name>.yml` with `on: workflow_call`
-2. Add a full input/secret table in the workflow file header comment
-3. Add a test job in `.github/workflows/test.yml`
-4. Add a row to the Reusable Workflows table in `README.md`
-5. Update the path trigger list in `tag-release.yml` if needed
+2. **Add its path to the `on.push.paths` list in `tag-release.yml`** — without this, merging to `main` will not trigger a new tag
+3. Add a full input/secret table in the workflow file header comment
+4. Add a test job in `.github/workflows/test.yml`
+5. Add a row to the Reusable Workflows table in `README.md`
 
 ## Adding a new composite action
 
