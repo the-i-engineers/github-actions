@@ -34,6 +34,15 @@ inputs:
       comment. Only required when pull_request_number is set.
     required: false
     default: ${{ github.token }}
+  label:
+    description: >
+      Optional label appended to the marker and heading when multiple workflows
+      post smoke test results to the same PR (e.g. "Prod" or "Nonprod"). When
+      set, marker becomes <!-- infrastructure-smoke-tests-summary-prod --> and
+      heading becomes "🔬 Infrastructure Smoke Tests — Prod". Leave empty to use
+      the defaults (backward-compatible with callers that do not pass this input).
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -46,12 +55,23 @@ runs:
         ROWS: ${{ inputs.rows }}
         PR_NUMBER: ${{ inputs.pull_request_number }}
         REPOSITORY: ${{ inputs.repository }}
+        LABEL: ${{ inputs.label }}
       run: |
-        MARKER='<!-- infrastructure-smoke-tests-summary -->'
+        # Trim leading/trailing whitespace so a whitespace-only label falls back to the default.
+        LABEL="${LABEL#"${LABEL%%[![:space:]]*}"}"
+        LABEL="${LABEL%"${LABEL##*[![:space:]]}"}"
+
+        if [[ -n "$LABEL" ]]; then
+          MARKER="<!-- infrastructure-smoke-tests-summary-${LABEL,,} -->"
+          TITLE="🔬 Infrastructure Smoke Tests — ${LABEL}"
+        else
+          MARKER='<!-- infrastructure-smoke-tests-summary -->'
+          TITLE='🔬 Infrastructure Smoke Tests'
+        fi
 
         {
           echo "$MARKER"
-          echo "## 🔬 Infrastructure Smoke Tests"
+          echo "## ${TITLE}"
           echo ""
           echo "| Stack | Test | Result |"
           echo "|-------|------|--------|"
@@ -61,9 +81,12 @@ runs:
         } > /tmp/smoke-summary.md
 
         # Find the most recent bot-authored marker comment.
+        # MARKER is passed via --arg to avoid jq injection if the label
+        # contains quotes, backslashes, or other special characters.
         EXISTING_ID=$(gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
           --paginate \
-          --jq ".[] | select((.body | contains(\"${MARKER}\")) and .user.login == \"github-actions[bot]\") | .id" \
+          | jq --arg marker "$MARKER" \
+            '.[] | select((.body | contains($marker)) and .user.login == "github-actions[bot]") | .id' \
           | tail -n 1)
 
         PAYLOAD=$(jq -n --rawfile body /tmp/smoke-summary.md '{"body": $body}')
