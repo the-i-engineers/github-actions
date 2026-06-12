@@ -252,6 +252,48 @@ jobs:
           fi
           echo "PASS: action correctly exited 1 when all_passed was false"
 
+  summary-custom-label:
+    name: 'Smoke Summary — Custom label produces labelled marker and heading'
+    needs: [changes, collect-all-pass]
+    if: >-
+      (needs.changes.outputs.smoke_collect_summary == 'true' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'pull_request'
+    runs-on: ${{ vars.REPOSITORY_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/smoke-test-summary
+        with:
+          rows: ${{ needs.collect-all-pass.outputs.rows }}
+          all_passed: ${{ needs.collect-all-pass.result == 'success' && 'true' || 'false' }}
+          pull_request_number: ${{ github.event.pull_request.number }}
+          token: ${{ github.token }}
+          label: Test
+
+      - name: Verify comment uses custom marker and heading
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          COMMENT_BODY=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- infrastructure-smoke-tests-summary-test -->"))] | last | .body // empty')
+          if [[ -z "$COMMENT_BODY" ]]; then
+            echo "::error::No infrastructure-smoke-tests-summary-test comment found on PR #${PR_NUMBER}"
+            exit 1
+          fi
+          if ! echo "$COMMENT_BODY" | grep -qF "🔬 Infrastructure Smoke Tests — Test"; then
+            echo "::error::Comment does not contain '🔬 Infrastructure Smoke Tests — Test'"
+            echo "--- comment body ---"
+            echo "$COMMENT_BODY"
+            exit 1
+          fi
+          echo "PASS: PR comment found with custom marker and '🔬 Infrastructure Smoke Tests — Test' heading"
+
   # ── scheduled-tag-release ─────────────────────────────────────────────────
 
   tag-release-daily:
@@ -343,6 +385,52 @@ jobs:
           fi
           echo "PASS: PR comment found with correct marker and '🚀 Terraform Summary' heading"
 
+  tf-check-custom-label:
+    name: 'TF Required Check — Creates PR comment with custom label'
+    needs: changes
+    if: >-
+      (needs.changes.outputs.terraform_summary == 'true' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    uses: ./.github/workflows/terraform-required-check.yml
+    with:
+      terraform_infra_result: success
+      pull_request_number: ${{ github.event.pull_request.number }}
+      label: Test
+
+  tf-check-verify-custom-label:
+    name: 'TF Required Check — Verify PR comment uses custom label marker and heading'
+    needs: [changes, tf-check-custom-label]
+    if: >-
+      always() &&
+      needs.tf-check-custom-label.result == 'success' &&
+      (needs.changes.outputs.terraform_summary == 'true' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Verify comment has custom marker and heading
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          COMMENT_BODY=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- terraform-required-check-summary-test -->"))] | last | .body // empty')
+          if [[ -z "$COMMENT_BODY" ]]; then
+            echo "::error::No terraform-required-check-summary-test comment found on PR #${PR_NUMBER}"
+            exit 1
+          fi
+          if ! echo "$COMMENT_BODY" | grep -qF "🚀 Terraform Summary — Test"; then
+            echo "::error::Comment does not contain '🚀 Terraform Summary — Test'"
+            echo "--- comment body ---"
+            echo "$COMMENT_BODY"
+            exit 1
+          fi
+          echo "PASS: PR comment found with custom marker and '🚀 Terraform Summary — Test' heading"
+
   # ── Gate — branch protection required check ───────────────────────────────
 
   test:
@@ -356,11 +444,13 @@ jobs:
       - collect-one-fail
       - summary-pass
       - summary-fail
+      - summary-custom-label
       - tag-release-daily
       - tag-release-weekly
       - tf-check-gate-pass-success
       - tf-check-gate-pass-skipped
       - tf-check-verify-comment
+      - tf-check-verify-custom-label
     if: always()
     runs-on: ubuntu-latest
     permissions:
