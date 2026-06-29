@@ -170,7 +170,7 @@ jobs:
         working-directory: ${{ inputs.environment }}/${{ inputs.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Compute stack identifier
         id: stack_id
@@ -457,7 +457,7 @@ jobs:
         id: approval
         timeout-minutes: ${{ inputs.approval_timeout_minutes }}
         if: steps.plan.outputs.plan != ''
-        uses: trstringer/manual-approval@74d99dff7380e3e4b122d4ededcbca2b6ce59367 # v1.12.0
+        uses: trstringer/manual-approval@fa642940caf8412403569b28b2db4a1df08a83a3 # v1.13.1
         with:
           secret: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
           approvers: ${{ inputs.approvers }}
