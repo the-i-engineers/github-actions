@@ -170,7 +170,7 @@ jobs:
         working-directory: ${{ inputs.environment }}/${{ inputs.platform }}
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Compute stack identifier
         id: stack_id
@@ -180,7 +180,7 @@ jobs:
           echo "id=$(printf '%s-%s' '${{ inputs.environment }}' '${{ inputs.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
 
       - name: Check for Changes
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         id: filter
         with:
           filters: |
@@ -258,7 +258,7 @@ jobs:
 
       - name: Setup tflint
         if: steps.filter.outputs.changes == 'true'
-        uses: terraform-linters/setup-tflint@b480b8fcdaa6f2c577f8e4fa799e89e756bb7c93 # v6.2.2
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
 
       - name: Run tflint
         if: steps.filter.outputs.changes == 'true'
@@ -457,7 +457,7 @@ jobs:
         id: approval
         timeout-minutes: ${{ inputs.approval_timeout_minutes }}
         if: steps.plan.outputs.plan != ''
-        uses: trstringer/manual-approval@74d99dff7380e3e4b122d4ededcbca2b6ce59367 # v1.12.0
+        uses: trstringer/manual-approval@fa642940caf8412403569b28b2db4a1df08a83a3 # v1.13.1
         with:
           secret: ${{ steps.app_token.outputs.token || secrets.GITHUB_TOKEN }}
           approvers: ${{ inputs.approvers }}
