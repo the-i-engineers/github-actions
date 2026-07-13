@@ -1,0 +1,73 @@
+name: SSO Redirect Smoke Test
+description: >
+  Follow the full redirect chain for a URL and verify the final effective URL
+  contains an expected host fragment (e.g. keycloak.platform.tie-dev.ch).
+  A matching effective URL proves both reachability and SSO enforcement.
+  Retries on failure with a configurable delay.
+
+inputs:
+  url:
+    description: URL to test.
+    required: true
+  expected_host_contains:
+    description: >
+      String that must appear in the final effective URL after following all
+      redirects. Use a hostname or hostname fragment, e.g.
+      "keycloak.platform.tie-dev.ch".
+    required: true
+  insecure:
+    description: >
+      Disable TLS certificate verification (-k flag). Use when the certificate
+      is self-signed or only valid via an imported CA.
+    required: false
+    default: "false"
+  retries:
+    description: Number of retry attempts after the initial failure.
+    required: false
+    default: "2"
+  retry_delay_seconds:
+    description: Seconds to wait between retry attempts.
+    required: false
+    default: "15"
+
+runs:
+  using: composite
+  steps:
+    - name: Check SSO redirect for ${{ inputs.url }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        INSECURE_FLAG=""
+        if [[ "${{ inputs.insecure }}" == "true" ]]; then
+          INSECURE_FLAG="-k"
+        fi
+
+        MAX_ATTEMPTS=$(( ${{ inputs.retries }} + 1 ))
+        ATTEMPT=0
+        PASSED=false
+
+        while [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
+          ATTEMPT=$(( ATTEMPT + 1 ))
+
+          EFFECTIVE_URL=$(curl $INSECURE_FLAG -L --max-redirs 10 -sS -o /dev/null \
+            -w '%{url_effective}' --max-time 15 '${{ inputs.url }}' 2>&1) || true
+
+          if [[ "$EFFECTIVE_URL" == *"${{ inputs.expected_host_contains }}"* ]]; then
+            echo "PASS (attempt $ATTEMPT/$MAX_ATTEMPTS): ${{ inputs.url }} → $EFFECTIVE_URL (contains '${{ inputs.expected_host_contains }}')"
+            PASSED=true
+            break
+          else
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: ${{ inputs.url }} → effective URL: '$EFFECTIVE_URL' (expected to contain: '${{ inputs.expected_host_contains }}')"
+          fi
+
+          if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
+            echo "Retrying in ${{ inputs.retry_delay_seconds }}s..."
+            sleep ${{ inputs.retry_delay_seconds }}
+          fi
+        done
+
+        if [[ "$PASSED" != "true" ]]; then
+          echo "FAIL: ${{ inputs.url }} did not redirect to a URL containing '${{ inputs.expected_host_contains }}' after $MAX_ATTEMPTS attempt(s)"
+          exit 1
+        fi
