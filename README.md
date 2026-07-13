@@ -7,6 +7,12 @@
 > For the current versions of all CI workflows (Terraform, smoke tests, app CI, lint-pr-title,
 > scheduled-tag-release), use `reusable-workflows` directly.
 
+---
+
+> **The content below is historical.** It describes the repository as it existed before archival and may be out of date. Refer to `reusable-workflows` for current documentation.
+
+---
+
 Reusable GitHub Actions workflows and composite actions for the [the-i-engineers](https://github.com/the-i-engineers) organisation.
 
 ## Scope
